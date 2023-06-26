@@ -13,6 +13,7 @@ use super::metric::{
 };
 use super::segment_agg_result::AggregationLimits;
 use super::VecWithNames;
+use crate::aggregation::{f64_to_fastfield_u64, Key};
 use crate::SegmentReader;
 
 #[derive(Default)]
@@ -67,7 +68,9 @@ impl AggregationWithAccessor {
                 field: field_name, ..
             }) => get_ff_reader(reader, field_name, Some(get_numeric_or_date_column_types()))?,
             Terms(TermsAggregation {
-                field: field_name, ..
+                field: field_name,
+                missing,
+                ..
             }) => {
                 str_dict_column = reader.fast_fields().str(field_name)?;
                 let allowed_column_types = [
@@ -80,10 +83,79 @@ impl AggregationWithAccessor {
                     // ColumnType::IpAddr Unsupported
                     // ColumnType::DateTime Unsupported
                 ];
-                let mut columns =
-                    get_all_ff_reader_or_empty(reader, field_name, Some(&allowed_column_types))?;
-                let first = columns.pop().unwrap();
+                // In case the column is empty we want the shim column to match the missing type
+                let fallback_type = missing
+                    .as_ref()
+                    .map(|missing| match missing {
+                        Key::Str(_) => ColumnType::Str,
+                        Key::F64(_) => ColumnType::F64,
+                    })
+                    .unwrap_or(ColumnType::U64);
+
+                let mut columns = get_all_ff_reader_or_empty(
+                    reader,
+                    field_name,
+                    Some(&allowed_column_types),
+                    fallback_type,
+                )?;
+                let mut first = columns.pop().unwrap();
                 accessor2 = columns.pop();
+                if let Some(missing) = missing {
+                    let assign_col_with_missing =
+                        |mut col: (Column, ColumnType), missing: &Key, match_type: bool| {
+                            // Set missing only if type matches (match_type). This will help to
+                            // avoid duplicates for mixed type
+                            // scenarios. Note: We can't assign the fake
+                            // text id u64::MAX to numerical columns (due to collisions).
+                            match missing {
+                                Key::Str(_) if col.1 == ColumnType::Str => {
+                                    let new_col = Column {
+                                        index: columnar::ColumnIndex::Full,
+                                        // Replace u64::MAX later with actual term
+                                        values: col.0.first_or_default_col(u64::MAX),
+                                    };
+
+                                    col.0 = new_col;
+                                }
+                                // Allow fallback to number on text fields
+                                Key::F64(_) if !match_type && col.1 == ColumnType::Str => {
+                                    let new_col = Column {
+                                        index: columnar::ColumnIndex::Full,
+                                        // Replace u64::MAX later with actual term
+                                        values: col.0.first_or_default_col(u64::MAX),
+                                    };
+
+                                    col.0 = new_col;
+                                }
+                                Key::F64(val) if col.1.numerical_type().is_some() => {
+                                    let val =
+                                        f64_to_fastfield_u64(*val, &col.1).unwrap_or_else(|| {
+                                            panic!(
+                                                "could not convert f64 to u64 for numerical col \
+                                                 type {}. This should never happen.",
+                                                col.1
+                                            )
+                                        });
+                                    let new_col = Column {
+                                        index: columnar::ColumnIndex::Full,
+                                        values: col.0.first_or_default_col(val),
+                                    };
+
+                                    col.0 = new_col;
+                                }
+                                _ => {}
+                            }
+                            col
+                        };
+                    // We want to match the type if we have multiple columns
+                    // Note that we have to match the type for numerical columns, even on single
+                    // columns as of now.
+                    let match_type = accessor2.is_some();
+                    first = assign_col_with_missing(first, missing, match_type);
+                    if let Some(col2) = accessor2 {
+                        accessor2 = Some(assign_col_with_missing(col2, missing, match_type));
+                    }
+                }
                 first
             }
             Average(AverageAggregation { field: field_name })
@@ -181,15 +253,13 @@ fn get_all_ff_reader_or_empty(
     reader: &SegmentReader,
     field_name: &str,
     allowed_column_types: Option<&[ColumnType]>,
+    fallback_type: ColumnType,
 ) -> crate::Result<Vec<(columnar::Column<u64>, ColumnType)>> {
     let ff_fields = reader.fast_fields();
     let mut ff_field_with_type =
         ff_fields.u64_lenient_for_type_all(allowed_column_types, field_name)?;
     if ff_field_with_type.is_empty() {
-        ff_field_with_type.push((
-            Column::build_empty_column(reader.num_docs()),
-            ColumnType::U64,
-        ));
+        ff_field_with_type.push((Column::build_empty_column(reader.num_docs()), fallback_type));
     }
     Ok(ff_field_with_type)
 }
