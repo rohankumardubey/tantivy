@@ -310,6 +310,10 @@ impl SegmentTermCollectorComposite {
             std::mem::swap(&mut accessor.0, &mut aggregations.accessor);
             std::mem::swap(&mut accessor.1, &mut aggregations.field_type);
         }
+        std::mem::swap(
+            &mut aggregations.missing_accessor1,
+            &mut aggregations.missing_accessor2,
+        );
     }
 
     pub(crate) fn from_req_and_validate(
@@ -388,9 +392,16 @@ impl SegmentAggregationCollector for SegmentTermCollector {
 
         let mem_pre = self.get_memory_consumption();
 
-        bucket_agg_accessor
-            .column_block_accessor
-            .fetch_block(docs, &bucket_agg_accessor.accessor);
+        if let Some(missing) = bucket_agg_accessor.missing_accessor1 {
+            bucket_agg_accessor
+                .column_block_accessor
+                .fetch_block_with_missing(docs, &bucket_agg_accessor.accessor, missing);
+        } else {
+            bucket_agg_accessor
+                .column_block_accessor
+                .fetch_block(docs, &bucket_agg_accessor.accessor);
+        }
+
         for term_id in bucket_agg_accessor.column_block_accessor.iter_vals() {
             let entry = self.term_buckets.entries.entry(term_id).or_default();
             *entry += 1;
