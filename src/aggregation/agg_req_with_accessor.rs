@@ -37,8 +37,8 @@ pub struct AggregationWithAccessor {
     /// Option or moved.
     pub(crate) accessor: Column<u64>,
     /// Load insert u64 for missing use case
-    pub(crate) missing_accessor1: Option<u64>,
-    pub(crate) missing_accessor2: Option<u64>,
+    pub(crate) missing_value_for_accessor1: Option<u64>,
+    pub(crate) missing_value_for_accessor2: Option<u64>,
     pub(crate) str_dict_column: Option<StrColumn>,
     pub(crate) field_type: ColumnType,
     /// In case there are multiple types of fast fields, e.g. string and numeric.
@@ -57,8 +57,7 @@ impl AggregationWithAccessor {
         reader: &SegmentReader,
         limits: AggregationLimits,
     ) -> crate::Result<AggregationWithAccessor> {
-        let mut missing_accessor1 = None;
-        let mut missing_accessor2 = None;
+        let mut missing_value_for_accessor1 = None;
         let mut str_dict_column = None;
         let mut accessor2 = None;
         use AggregationVariants::*;
@@ -106,32 +105,12 @@ impl AggregationWithAccessor {
                 let first = columns.pop().unwrap();
                 accessor2 = columns.pop();
                 if let Some(missing) = missing {
-                    let assign_col_with_missing =
-                        |col: &ColumnType, missing: &Key, match_type: bool| {
-                            // Set missing only if type matches (match_type). This will help to
-                            // avoid duplicates for mixed type
-                            // scenarios. Note: We can't assign the fake
-                            // text id u64::MAX to numerical columns (due to collisions).
-                            match missing {
-                                Key::Str(_) if col == &ColumnType::Str => Some(u64::MAX),
-                                // Allow fallback to number on text fields
-                                Key::F64(_) if !match_type && col == &ColumnType::Str => {
-                                    Some(u64::MAX)
-                                }
-                                Key::F64(val) if col.numerical_type().is_some() => {
-                                    f64_to_fastfield_u64(*val, &col)
-                                }
-                                _ => None,
-                            }
-                        };
-                    // We want to match the type if we have multiple columns
-                    // Note that we have to match the type for numerical columns, even on single
-                    // columns as of now.
-                    let match_type = accessor2.is_some();
-                    missing_accessor1 = assign_col_with_missing(&first.1, missing, match_type);
-                    if let Some(col2) = accessor2.as_ref() {
-                        missing_accessor2 = assign_col_with_missing(&col2.1, missing, match_type);
-                    }
+                    missing_value_for_accessor1 = handle_missing(
+                        first.1,
+                        missing,
+                        field_name,
+                        accessor2.as_ref().map(|el| &el.0),
+                    )?;
                 }
                 first
             }
@@ -160,8 +139,8 @@ impl AggregationWithAccessor {
         Ok(AggregationWithAccessor {
             accessor,
             accessor2,
-            missing_accessor1,
-            missing_accessor2,
+            missing_value_for_accessor1,
+            missing_value_for_accessor2: None,
             field_type,
             sub_aggregation: get_aggs_with_segment_accessor_and_validate(
                 &sub_aggregation,
@@ -174,6 +153,35 @@ impl AggregationWithAccessor {
             column_block_accessor: Default::default(),
         })
     }
+}
+
+fn handle_missing(
+    column_type: ColumnType,
+    missing: &Key,
+    field_name: &str,
+    second_column: Option<&Column>,
+) -> crate::Result<Option<u64>> {
+    if let Some(_column) = second_column {
+        return Err(crate::TantivyError::InvalidArgument(format!(
+            "Missing value for field {} is not supported for multiple columns",
+            field_name
+        )));
+    }
+    let missing_val = match missing {
+        Key::Str(_) if column_type == ColumnType::Str => Some(u64::MAX),
+        // Allow fallback to number on text fields
+        Key::F64(_) if column_type == ColumnType::Str => Some(u64::MAX),
+        Key::F64(val) if column_type.numerical_type().is_some() => {
+            f64_to_fastfield_u64(*val, &column_type)
+        }
+        _ => {
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "Missing value {:?} for field {} is not supported for column type {:?}",
+                missing, field_name, column_type
+            )));
+        }
+    };
+    Ok(missing_val)
 }
 
 fn get_numeric_or_date_column_types() -> &'static [ColumnType] {
